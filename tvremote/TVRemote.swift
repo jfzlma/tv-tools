@@ -44,26 +44,46 @@ final class AdbLink: ObservableObject {
     }()
 
     init() {
-        serial = UserDefaults.standard.string(forKey: "serial") ?? "192.168.220.110:5555"
+        serial = UserDefaults.standard.string(forKey: "serial") ?? ""
     }
 
     var isConnected: Bool { if case .connected = state { return true } else { return false } }
+
+    /// "192.168.1.50" -> "192.168.1.50:5555"; USB serials and host:port pass through.
+    static func normalize(_ raw: String) -> String {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = t.split(separator: ".")
+        if !t.contains(":"), parts.count == 4, parts.allSatisfy({ UInt8($0) != nil }) { return t + ":5555" }
+        return t
+    }
 
     func connect() {
         teardown()
         generation += 1
         let gen = generation
+        let target = Self.normalize(serial)
+        guard !target.isEmpty else {
+            state = .failed("No TV selected · use Find TV")
+            return
+        }
+        if target != serial { serial = target }
         state = .connecting
-        let target = serial.trimmingCharacters(in: .whitespaces)
 
         DispatchQueue.global().async {
             // `adb connect` only applies to network targets (host:port).
+            var reachable = true
             if target.contains(":") {
-                _ = Self.run([Self.adbPath, "connect", target])
+                let out = Self.run([Self.adbPath, "connect", target], timeout: 8)
+                reachable = !(out.contains("failed") || out.contains("unable") || out.contains("refused") || out.isEmpty)
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self, gen == self.generation else { return }
-                self.startShell(target: target, gen: gen)
+                if reachable {
+                    self.startShell(target: target, gen: gen)
+                } else {
+                    self.state = .failed("Can't reach \(target) · try Find TV")
+                    self.scheduleRetry()
+                }
             }
         }
     }
@@ -260,16 +280,174 @@ final class AdbLink: ObservableObject {
         return b
     }
 
-    nonisolated private static func run(_ args: [String]) -> String {
+    /// Runs a command, killing it after `timeout` seconds (adb can hang on non-adb hosts).
+    nonisolated static func run(_ args: [String], timeout: TimeInterval = 10) -> String {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: args[0])
         p.arguments = Array(args.dropFirst())
         let out = Pipe()
         p.standardOutput = out
         p.standardError = out
+        // Collect output as it arrives: never read to EOF, because `adb` may fork its server
+        // daemon, which inherits the pipe and keeps it open indefinitely.
+        let buffer = OutputBuffer()
+        out.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil } else { buffer.append(d) }
+        }
+        let done = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in done.signal() }
         do { try p.run() } catch { return "" }
-        p.waitUntilExit()
-        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if done.wait(timeout: .now() + timeout) == .timedOut { p.terminate() }
+        Thread.sleep(forTimeInterval: 0.05) // let the last chunk land
+        out.fileHandleForReading.readabilityHandler = nil
+        return buffer.string
+    }
+}
+
+final class OutputBuffer: @unchecked Sendable {
+    private var data = Data()
+    private let lock = NSLock()
+    func append(_ d: Data) { lock.lock(); data.append(d); lock.unlock() }
+    var string: String { lock.lock(); defer { lock.unlock() }; return String(data: data, encoding: .utf8) ?? "" }
+}
+
+// MARK: - TV discovery
+
+struct FoundTV: Identifiable, Hashable {
+    let serial: String
+    let name: String
+    var id: String { serial }
+}
+
+/// Finds TVs by probing every host on the Mac's local /24 networks for the adb port (5555),
+/// then asking each responder for its model name. Also lists devices adb already knows.
+@MainActor
+final class TVFinder: ObservableObject {
+    @Published private(set) var scanning = false
+    @Published private(set) var message = ""
+    @Published private(set) var found: [FoundTV] = []
+
+    func scan(completion: @escaping ([FoundTV]) -> Void = { _ in }) {
+        guard !scanning else { return }
+        let subnets = Self.localSubnets()
+        guard !subnets.isEmpty else {
+            message = "Mac isn't on a Wi-Fi or Ethernet network"
+            return
+        }
+        scanning = true
+        found = []
+        message = "Scanning " + subnets.map { "\($0).x" }.joined(separator: ", ") + "…"
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let results = Self.discover(subnets: subnets)
+            DispatchQueue.main.async {
+                self.scanning = false
+                self.found = results
+                self.message = results.isEmpty
+                    ? "No TV found. Is network debugging on and the TV on this network?"
+                    : "Found \(results.count). Pick your TV:"
+                completion(results)
+            }
+        }
+    }
+
+    nonisolated private static func discover(subnets: [String]) -> [FoundTV] {
+        let adb = AdbLink.adbPath
+        var candidates = Set<String>()
+
+        // Devices adb is already attached to (USB or network).
+        for line in AdbLink.run([adb, "devices"], timeout: 5).split(separator: "\n") {
+            let cols = line.split(separator: "\t")
+            if cols.count == 2, cols[1] == "device" { candidates.insert(String(cols[0])) }
+        }
+
+        // Every host with the adb port open. TV Wi-Fi chips doze, so the first contact (ARP +
+        // wake-up) can take over a second; a quick pass wakes them, a slower pass catches them.
+        let lock = NSLock()
+        let hosts = subnets.flatMap { subnet in (1...254).map { "\(subnet).\($0)" } }
+        for timeoutMs: Int32 in [900, 2000] {
+            let group = DispatchGroup()
+            let gate = DispatchSemaphore(value: 96)
+            for ip in hosts {
+                gate.wait()
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    defer { gate.signal(); group.leave() }
+                    if portOpen(ip, 5555, timeoutMs: timeoutMs) {
+                        lock.lock(); candidates.insert("\(ip):5555"); lock.unlock()
+                    }
+                }
+            }
+            group.wait()
+            if candidates.contains(where: { $0.hasSuffix(":5555") }) { break }
+        }
+
+        // Identify each candidate.
+        var results: [FoundTV] = []
+        for serial in candidates.sorted() {
+            if serial.contains(":") { _ = AdbLink.run([adb, "connect", serial], timeout: 5) }
+            let out = AdbLink.run([adb, "-s", serial, "shell", "getprop", "ro.product.model"], timeout: 5)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let name: String
+            if out.contains("unauthorized") {
+                name = "Allow USB debugging on the TV, then scan again"
+            } else if out.isEmpty || out.contains("error") || out.contains("failed") || out.contains("offline") {
+                continue // port 5555 open, but not a usable adb device
+            } else {
+                name = out
+            }
+            results.append(FoundTV(serial: serial, name: name))
+        }
+        return results
+    }
+
+    /// First three octets of each active IPv4 Wi-Fi/Ethernet interface, e.g. "192.168.1".
+    nonisolated private static func localSubnets() -> [String] {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return [] }
+        defer { freeifaddrs(head) }
+        var subnets: [String] = []
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let ifa = ptr.pointee
+            let flags = Int32(ifa.ifa_flags)
+            guard let addr = ifa.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET),
+                  flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0,
+                  String(cString: ifa.ifa_name).hasPrefix("en") else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host, socklen_t(host.count),
+                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let ip = String(cString: host)
+            guard !ip.hasPrefix("169.254.") else { continue } // no DHCP lease
+            let subnet = ip.split(separator: ".").prefix(3).joined(separator: ".")
+            if !subnets.contains(subnet) { subnets.append(subnet) }
+        }
+        return subnets
+    }
+
+    nonisolated private static func portOpen(_ ip: String, _ port: UInt16, timeoutMs: Int32) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        guard inet_pton(AF_INET, ip, &addr.sin_addr) == 1 else { return false }
+        let rc = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if rc == 0 { return true }
+        guard errno == EINPROGRESS else { return false }
+        var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        guard poll(&pfd, 1, timeoutMs) == 1 else { return false }
+        var err: Int32 = 0
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len)
+        return err == 0
     }
 }
 
@@ -449,6 +627,7 @@ struct HoldButton<Label: View>: View {
 struct RemoteView: View {
     @ObservedObject var link: AdbLink
     @ObservedObject var capture: PointerCapture
+    @ObservedObject var finder: TVFinder
     @State private var text = ""
     @State private var showNumbers = false
     @AppStorage("onTop") private var onTop = true
@@ -538,10 +717,39 @@ struct RemoteView: View {
                 Toggle("On top", isOn: $onTop).toggleStyle(.checkbox).font(.caption)
             }
             HStack {
-                TextField("host:port", text: $link.serial, onCommit: link.connect)
+                TextField("TV IP, e.g. 192.168.1.50", text: $link.serial, onCommit: link.connect)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 11, design: .monospaced))
                 Button(link.isConnected ? "Reconnect" : "Connect", action: link.connect)
+                    .disabled(link.serial.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            HStack(spacing: 8) {
+                Button(finder.scanning ? "Scanning…" : "Find TV") { finder.scan() }
+                    .disabled(finder.scanning)
+                if finder.scanning { ProgressView().controlSize(.small) }
+                Text(finder.message)
+                    .font(.system(size: 10))
+                    .foregroundColor(.gray)
+                    .lineLimit(2)
+                Spacer(minLength: 0)
+            }
+            ForEach(finder.found) { tv in
+                Button {
+                    link.serial = tv.serial
+                    link.connect()
+                } label: {
+                    HStack {
+                        Image(systemName: link.serial == tv.serial ? "checkmark.circle.fill" : "tv")
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(tv.name).font(.caption).lineLimit(1)
+                            Text(tv.serial).font(.system(size: 10, design: .monospaced)).foregroundColor(.gray)
+                        }
+                        Spacer()
+                    }
+                    .padding(6)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color(white: 0.16)))
+                }
+                .buttonStyle(.plain)
             }
         }
         .frame(width: 260)
@@ -628,6 +836,7 @@ struct TVRemoteApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var link = AdbLink()
     @StateObject private var capture = PointerCapture()
+    @StateObject private var finder = TVFinder()
     private let keyboard = KeyboardBridge()
 
     init() {
@@ -636,12 +845,19 @@ struct TVRemoteApp: App {
 
     var body: some Scene {
         WindowGroup("TV Remote") {
-            RemoteView(link: link, capture: capture)
+            RemoteView(link: link, capture: capture, finder: finder)
                 .preferredColorScheme(.dark)
                 .onAppear {
                     keyboard.capture = capture
                     keyboard.install(link: link)
-                    link.connect()
+                    if link.serial.isEmpty {
+                        // First run: look for the TV and pick it if it's the only one.
+                        finder.scan { found in
+                            if found.count == 1 { link.serial = found[0].serial; link.connect() }
+                        }
+                    } else {
+                        link.connect()
+                    }
                 }
         }
         .windowResizability(.contentSize)
