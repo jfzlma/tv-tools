@@ -77,26 +77,6 @@ Key codes come from the TV's `/vendor/usr/keylayout/Vendor_0001_Product_0001.kl`
 **Requirements:** raw input injection needs a root adb shell (true on this TV's `eng` firmware).
 On a TV whose adb shell isn't root, the app shows "No root access to input device".
 
-## 3. Mini Launcher (minilauncher/)
-
-Minimal D-pad home screen: clock, TV Settings tile, then every launchable app (banners for TV apps).
-OK opens an app; hold OK or press Menu for its app info. ~12 MB RAM vs ~31 MB for Projectivy.
-
-```sh
-minilauncher/build.sh                       # aapt2 + javac + d8 + apksigner, no Gradle
-adb -s $TV install -r minilauncher/MiniLauncher.apk
-adb -s $TV shell cmd package set-home-activity local.minilauncher/.MainActivity
-```
-
-Revert to the previous launcher (Projectivy here):
-
-```sh
-adb -s $TV shell cmd package set-home-activity com.spocky.projengmenu/.ui.home.MainActivity
-```
-
-`build.sh` creates `minilauncher.keystore` on first run. Keep it: `install -r` over the installed
-app only works with the same key.
-
 ## Scripts
 
 - `find-tv.sh [subnet]` lists TVs on the network with adb open.
